@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
-    { name = "Ricky" }
+    { name = "r-near" }
 ]
 keywords = ["borsh", "serialization", "pydantic", "solana", "near", "blockchain"]
 classifiers = [
