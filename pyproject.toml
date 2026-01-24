@@ -186,11 +186,10 @@ exclude_lines = [
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
 branch = "main"
-build_command = "uv build"
+build_command = "pip install build && python -m build"
 commit_message = "chore(release): {version} [skip ci]"
 
 [tool.semantic_release.changelog]
-template_dir = ".github/templates"
 exclude_commit_patterns = [
     "^chore\\(release\\):",
     "^Merge",
