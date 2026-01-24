@@ -132,7 +132,7 @@ ignore = [
 "src/pyborsh/mixin.py" = [
     "C901",     # complexity - serialize/deserialize need big switch
     "PLR0911",  # many returns - one per type kind
-    "PLR0912",  # many branches - one per type kind  
+    "PLR0912",  # many branches - one per type kind
     "PLR0915",  # many statements - inherent to serialization
     "PLC0415",  # import not at top - avoiding circular imports
     "ARG001",   # unused arg model_class - kept for API consistency

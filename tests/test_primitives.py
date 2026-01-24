@@ -1,6 +1,5 @@
 """Basic tests for PyBorsh."""
 
-
 import pytest
 
 from pyborsh import (
