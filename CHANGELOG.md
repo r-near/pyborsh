@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v1.1.0 (2026-07-21)
+
+### Features
+
+- Canonical Borsh encoding, hardened decoding, and property-based tests
+  ([#3](https://github.com/r-near/pyborsh/pull/3),
+  [`76d65b3`](https://github.com/r-near/pyborsh/commit/76d65b3050e551bdeea7f1c34ed372d982ae62b7))
+
+
 ## v1.0.2 (2026-07-21)
 
 ### Bug Fixes
