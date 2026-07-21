@@ -16,6 +16,7 @@ PyBorsh lets you define data structures using standard Pydantic models and seria
 - 🔒 **Type-safe** — Explicit integer width annotations (`U8`, `U32`, `U128`, etc.) prevent overflow bugs
 - ⚡ **Fast** — Direct binary serialization without intermediate representations
 - 🦀 **Rust-compatible** — 100% compatible with Rust's `borsh` crate for cross-language interop
+- 📐 **Canonical** — Bijective object↔bytes mapping per the [Borsh spec](https://borsh.io/): maps and sets are encoded sorted by key, NaN is rejected, and `from_borsh` requires the full input to be consumed. Like Rust borsh, collections of zero-sized element types (e.g. `list[EmptyModel]`) are rejected on both encode and decode
 
 ## Installation
 
@@ -89,8 +90,8 @@ PyBorsh maps Python types to Borsh types:
 | `Annotated[bytes, Bytes(N)]` | `[u8; N]` | Fixed-size bytes |
 | `list[T]` | `Vec<T>` | Dynamic array |
 | `Annotated[list[T], Array(T, N)]` | `[T; N]` | Fixed-size array |
-| `set[T]` | `HashSet<T>` | Hash set |
-| `dict[K, V]` | `HashMap<K, V>` | Hash map |
+| `set[T]` | `HashSet<T>` | Encoded sorted by element |
+| `dict[K, V]` | `HashMap<K, V>` | Encoded sorted by key |
 | `tuple[A, B, C]` | `(A, B, C)` | Fixed tuple |
 | `T \| None` | `Option<T>` | Optional value |
 | `NestedModel` | `struct` | Nested struct |
@@ -248,10 +249,17 @@ class Bad(Borsh, BaseModel):
 
 # Serialization errors
 player = Player(health=256, ...)  # Error: 256 out of range for u8
+Temperature(celsius=float("nan")).to_borsh()  # Error: NaN is not a valid Borsh value
 
 # Deserialization errors
 Player.from_borsh(b"corrupted")  # Error: Unexpected end of data
+Player.from_borsh(valid_bytes + b"\x00")  # Error: Not all bytes read: 1 trailing bytes
 ```
+
+Deserialization failures always raise `BorshDeserializationError` (invalid enum
+discriminants, malformed UTF-8, truncated input, trailing bytes), and
+serialization failures raise `BorshSerializationError`—no bare `ValueError` or
+`struct.error` leaks through.
 
 ## Development
 
@@ -261,7 +269,8 @@ git clone https://github.com/r-near/pyborsh.git
 cd pyborsh
 uv sync --all-extras
 
-# Run tests
+# Run tests (includes a Hypothesis property-based suite covering round-trip,
+# determinism, and malformed-input behavior; HYPOTHESIS_PROFILE=ci for more examples)
 uv run pytest
 
 # Run linting

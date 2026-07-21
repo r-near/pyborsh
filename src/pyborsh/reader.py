@@ -1,5 +1,6 @@
 """Borsh binary reader for deserialization."""
 
+import math
 import struct
 
 from pyborsh.errors import BorshDeserializationError
@@ -99,16 +100,20 @@ class BorshReader:
         return value
 
     def read_f32(self) -> float:
-        """Read a 32-bit float (IEEE 754, little-endian)."""
+        """Read a 32-bit float (IEEE 754, little-endian). Rejects NaN."""
         self._ensure_bytes(4)
         (value,) = struct.unpack("<f", self._data[self._offset : self._offset + 4])
+        if math.isnan(value):  # Borsh spec: err_if_nan
+            raise BorshDeserializationError("NaN is not a valid Borsh value")
         self._offset += 4
         return float(value)
 
     def read_f64(self) -> float:
-        """Read a 64-bit float (IEEE 754, little-endian)."""
+        """Read a 64-bit float (IEEE 754, little-endian). Rejects NaN."""
         self._ensure_bytes(8)
         (value,) = struct.unpack("<d", self._data[self._offset : self._offset + 8])
+        if math.isnan(value):  # Borsh spec: err_if_nan
+            raise BorshDeserializationError("NaN is not a valid Borsh value")
         self._offset += 8
         return float(value)
 
