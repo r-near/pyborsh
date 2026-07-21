@@ -305,8 +305,10 @@ class TestRustCompatibility:
 
     def test_serialize_matches_rust(self, rust_bytes: bytes, expected_game_state: GameState):
         """Test that our serialization produces identical bytes to Rust."""
-        # Note: HashMap/HashSet ordering may differ, so we compare via round-trip
+        # pyborsh sorts HashMap/HashSet by key, matching Rust borsh's canonical
+        # ordering, so the encodings are byte-for-byte identical.
         serialized = expected_game_state.to_borsh()
+        assert serialized == rust_bytes
 
         # Deserialize both and compare
         from_rust = GameState.from_borsh(rust_bytes)

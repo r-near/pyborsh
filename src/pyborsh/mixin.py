@@ -1,14 +1,44 @@
 """Borsh mixin for Pydantic models."""
 
+import struct
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Self
 
 from pyborsh.errors import BorshDeserializationError, BorshSerializationError
 from pyborsh.reader import BorshReader
-from pyborsh.schema import BorshFieldType, build_model_schema
+from pyborsh.schema import BorshFieldType, build_model_schema, is_zero_size
 from pyborsh.writer import BorshWriter
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
+
+# borsh-rs likewise rejects these (check_zst): a u32 length prefix over
+# elements that occupy zero bytes lets a tiny input demand unbounded decode
+# work, and nesting such collections amplifies it quadratically. Rejection is
+# symmetric (encode and decode) so pyborsh never emits bytes it would refuse
+# to read back.
+_ZST_COLLECTION_ERROR = (
+    "Collections of zero-sized element types are not supported "
+    "(denial-of-service vector on deserialization; borsh-rs forbids them too)"
+)
+
+
+def _sort_key_for(field_type: BorshFieldType) -> Callable[[Any], Any]:
+    """Build the sort key that orders HashSet/HashMap entries like Rust Ord.
+
+    Option<T> is Ord in Rust (None < Some, matching the 0x00 < 0x01 byte
+    order), so optional elements/keys must sort None-first instead of
+    failing. Tuples recurse per slot. Every other supported element/key kind
+    (ints, str, bytes, bool) orders by Python value, which matches Rust Ord
+    -- note ints compare numerically, NOT by their little-endian encoding.
+    """
+    if field_type.kind == "option" and field_type.element_type is not None:
+        inner_key = _sort_key_for(field_type.element_type)
+        return lambda x: (False, ()) if x is None else (True, inner_key(x))
+    if field_type.kind == "tuple" and field_type.tuple_element_types is not None:
+        slot_keys = [_sort_key_for(t) for t in field_type.tuple_element_types]
+        return lambda items: tuple(key(item) for key, item in zip(slot_keys, items, strict=True))
+    return lambda x: x
 
 
 class Borsh:
@@ -36,14 +66,15 @@ class Borsh:
             bytes: The Borsh-encoded binary data.
 
         Raises:
-            BorshSerializationError: If serialization fails.
+            BorshSerializationError: If serialization fails (e.g., value out of
+                range, NaN float, or unorderable set/map keys).
         """
         try:
             schema = build_model_schema(type(self))
             writer = BorshWriter()
             _serialize_struct(writer, self, schema)
             return writer.get_buffer()
-        except ValueError as e:
+        except (ValueError, TypeError, OverflowError) as e:
             raise BorshSerializationError(str(e)) from e
 
     @classmethod
@@ -58,12 +89,15 @@ class Borsh:
             An instance of the model.
 
         Raises:
-            BorshDeserializationError: If deserialization fails.
+            BorshDeserializationError: If deserialization fails, the data is
+                malformed, or trailing bytes remain after the value.
         """
-        schema = build_model_schema(cls)
-        reader = BorshReader(data)
-        field_values = _deserialize_struct(reader, cls, schema)
-        return cls.model_validate(field_values)  # type: ignore[attr-defined, no-any-return]
+        try:
+            return _deserialize_model(cls, data)  # type: ignore[no-any-return]
+        except BorshDeserializationError:
+            raise
+        except (ValueError, TypeError, OverflowError, RecursionError, struct.error) as e:
+            raise BorshDeserializationError(str(e)) from e
 
 
 def _serialize_struct(
@@ -137,6 +171,8 @@ def _serialize_value(writer: BorshWriter, value: Any, field_type: BorshFieldType
     elif kind == "vec":
         if field_type.element_type is None:
             raise BorshSerializationError("Vec type must have element_type")
+        if is_zero_size(field_type.element_type):
+            raise BorshSerializationError(_ZST_COLLECTION_ERROR)
         writer.write_u32(len(value))
         for item in value:
             _serialize_value(writer, item, field_type.element_type)
@@ -145,16 +181,37 @@ def _serialize_value(writer: BorshWriter, value: Any, field_type: BorshFieldType
     elif kind == "hashset":
         if field_type.element_type is None:
             raise BorshSerializationError("HashSet type must have element_type")
-        writer.write_u32(len(value))
-        for item in value:
+        if is_zero_size(field_type.element_type):
+            raise BorshSerializationError(_ZST_COLLECTION_ERROR)
+        # Borsh spec: unordered containers are serialized in sorted order
+        # (Rust Ord order -- see _sort_key_for)
+        try:
+            items = sorted(value, key=_sort_key_for(field_type.element_type))
+        except TypeError as e:
+            raise BorshSerializationError(
+                f"HashSet elements must be orderable for canonical Borsh encoding: {e}"
+            ) from e
+        writer.write_u32(len(items))
+        for item in items:
             _serialize_value(writer, item, field_type.element_type)
 
     # HashMap<K, V>
     elif kind == "hashmap":
         if field_type.key_type is None or field_type.value_type is None:
             raise BorshSerializationError("HashMap type must have key_type and value_type")
-        writer.write_u32(len(value))
-        for k, v in value.items():
+        if is_zero_size(field_type.key_type):
+            raise BorshSerializationError(_ZST_COLLECTION_ERROR)
+        # Borsh spec: unordered containers are serialized in sorted order by key
+        # (Rust Ord order -- see _sort_key_for)
+        key_fn = _sort_key_for(field_type.key_type)
+        try:
+            entries = sorted(value.items(), key=lambda kv: key_fn(kv[0]))
+        except TypeError as e:
+            raise BorshSerializationError(
+                f"HashMap keys must be orderable for canonical Borsh encoding: {e}"
+            ) from e
+        writer.write_u32(len(entries))
+        for k, v in entries:
             _serialize_value(writer, k, field_type.key_type)
             _serialize_value(writer, v, field_type.value_type)
 
@@ -213,7 +270,7 @@ def _serialize_borsh_enum(writer: BorshWriter, value: Any, enum_class: type) -> 
 
     # Find which variant this value is
     value_type = type(value)
-    variants = getattr(enum_class, "_variants", {})
+    variants: dict[str, tuple[int, type]] = getattr(enum_class, "_variants", {})
 
     for _variant_name, (variant_index, variant_cls) in variants.items():
         if value_type is variant_cls:
@@ -230,6 +287,17 @@ def _serialize_borsh_enum(writer: BorshWriter, value: Any, enum_class: type) -> 
             return
 
     raise BorshSerializationError(f"Value {value} is not a valid variant of {enum_class.__name__}")
+
+
+def _deserialize_model(model_class: type, data: bytes) -> Any:
+    """Deserialize a top-level model, requiring every input byte to be consumed."""
+    schema = build_model_schema(model_class)
+    reader = BorshReader(data)
+    field_values = _deserialize_struct(reader, model_class, schema)
+    # Borsh requires an exact encoding: reject trailing garbage (top-level only)
+    if reader.remaining != 0:
+        raise BorshDeserializationError(f"Not all bytes read: {reader.remaining} trailing bytes")
+    return model_class.model_validate(field_values)  # type: ignore[attr-defined]
 
 
 def _deserialize_struct(
@@ -306,21 +374,44 @@ def _deserialize_value(reader: BorshReader, field_type: BorshFieldType) -> Any:
     if kind == "vec":
         if field_type.element_type is None:
             raise BorshDeserializationError("Vec type must have element_type")
+        if is_zero_size(field_type.element_type):
+            raise BorshDeserializationError(_ZST_COLLECTION_ERROR)
         length = reader.read_u32()
+        # Zero-size element types were rejected above, so every element
+        # consumes at least one input byte: a declared length beyond the
+        # remaining input is malformed. Since that holds for every container,
+        # nested ones included, total decode work stays linear in the input
+        # size (guards against huge-allocation DoS).
+        if length > reader.remaining:
+            raise BorshDeserializationError(
+                f"Vec length {length} exceeds remaining data ({reader.remaining} bytes)"
+            )
         return [_deserialize_value(reader, field_type.element_type) for _ in range(length)]
 
     # HashSet<T>
     if kind == "hashset":
         if field_type.element_type is None:
             raise BorshDeserializationError("HashSet type must have element_type")
+        if is_zero_size(field_type.element_type):
+            raise BorshDeserializationError(_ZST_COLLECTION_ERROR)
         length = reader.read_u32()
+        if length > reader.remaining:
+            raise BorshDeserializationError(
+                f"HashSet length {length} exceeds remaining data ({reader.remaining} bytes)"
+            )
         return {_deserialize_value(reader, field_type.element_type) for _ in range(length)}
 
     # HashMap<K, V>
     if kind == "hashmap":
         if field_type.key_type is None or field_type.value_type is None:
             raise BorshDeserializationError("HashMap type must have key_type and value_type")
+        if is_zero_size(field_type.key_type):
+            raise BorshDeserializationError(_ZST_COLLECTION_ERROR)
         length = reader.read_u32()
+        if length > reader.remaining:
+            raise BorshDeserializationError(
+                f"HashMap length {length} exceeds remaining data ({reader.remaining} bytes)"
+            )
         result = {}
         for _ in range(length):
             k = _deserialize_value(reader, field_type.key_type)
@@ -357,7 +448,12 @@ def _deserialize_value(reader: BorshReader, field_type: BorshFieldType) -> Any:
         if field_type.enum_class is None:
             raise BorshDeserializationError("Enum type must have enum_class")
         variant_index = reader.read_enum_discriminant()
-        return field_type.enum_class(variant_index)
+        try:
+            return field_type.enum_class(variant_index)
+        except ValueError as e:
+            raise BorshDeserializationError(
+                f"Invalid discriminant {variant_index} for {field_type.enum_class.__name__}"
+            ) from e
 
     # Literal - not deserialized, return None (will be provided by Pydantic model default)
     if kind == "literal":

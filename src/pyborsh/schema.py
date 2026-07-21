@@ -3,7 +3,11 @@
 import types
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Any, Literal, Union, get_args, get_origin
+from weakref import WeakKeyDictionary
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 from pyborsh.errors import BorshSchemaError
 from pyborsh.types import (
@@ -253,9 +257,21 @@ def infer_borsh_type(python_type: Any, field_name: str) -> BorshFieldType:
     )
 
 
+# Weak keys: schemas are cached for a class's lifetime, but the cache must
+# not BE what keeps the class alive. functools.cache would pin dynamically
+# created models (pydantic.create_model, per-request classes) plus their
+# schemas for the whole process; with weak keys the entry dies with the class.
+_SCHEMA_CACHE: WeakKeyDictionary[type, dict[str, BorshFieldType]] = WeakKeyDictionary()
+
+
 def build_model_schema(model_class: type) -> dict[str, BorshFieldType]:
     """
     Build a complete Borsh schema from a Pydantic model class.
+
+    Results are cached per model class (schemas are fixed once a model is
+    defined), so repeated serialization does not rebuild them. The cache
+    holds its keys weakly, so dynamically created model classes remain
+    garbage-collectable; their cached schemas are dropped with them.
 
     Args:
         model_class: A Pydantic BaseModel subclass.
@@ -263,6 +279,8 @@ def build_model_schema(model_class: type) -> dict[str, BorshFieldType]:
     Returns:
         Dict mapping field names to their BorshFieldType.
     """
+    # Validate before touching the cache: non-model arguments (e.g. `str`)
+    # must raise BorshSchemaError, and built-in types are not weak-referenceable.
     try:
         from pydantic import BaseModel
 
@@ -271,6 +289,15 @@ def build_model_schema(model_class: type) -> dict[str, BorshFieldType]:
     except ImportError as err:  # pragma: no cover
         raise BorshSchemaError("Pydantic is not installed") from err
 
+    schema = _SCHEMA_CACHE.get(model_class)
+    if schema is None:
+        schema = _build_model_schema(model_class)
+        _SCHEMA_CACHE[model_class] = schema
+    return schema
+
+
+def _build_model_schema(model_class: "type[BaseModel]") -> dict[str, BorshFieldType]:
+    """Uncached implementation of build_model_schema."""
     schema: dict[str, BorshFieldType] = {}
 
     for field_name, field_info in model_class.model_fields.items():
@@ -325,3 +352,44 @@ def extract_borsh_type_with_metadata(
 
     # No marker in metadata, try full extraction (for non-Pydantic or nested types)
     return extract_borsh_type(annotation, field_name)
+
+
+def is_zero_size(field_type: BorshFieldType) -> bool:
+    """
+    Whether every value of this type occupies zero bytes on the wire.
+
+    Zero-size subtrees are empty (or literal-only) structs, zero-length
+    fixed arrays/bytes, and tuples/arrays composed of those. They make a
+    collection's u32 length prefix meaningless: a few input bytes can
+    declare billions of elements that consume nothing, so vec/hashset
+    element types and hashmap key types must not be zero-size (mirrors
+    borsh-rs `check_zst`).
+    """
+    return _is_zero_size(field_type, frozenset())
+
+
+def _is_zero_size(field_type: BorshFieldType, seen: frozenset[type]) -> bool:
+    kind = field_type.kind
+    if kind == "literal":
+        return True  # literal fields are never written
+    if kind == "fixed_bytes":
+        return field_type.length == 0
+    if kind == "fixed_array":
+        if field_type.length == 0:
+            return True
+        return field_type.element_type is not None and _is_zero_size(field_type.element_type, seen)
+    if kind == "tuple":
+        return field_type.tuple_element_types is not None and all(
+            _is_zero_size(t, seen) for t in field_type.tuple_element_types
+        )
+    if kind == "struct":
+        cls = field_type.struct_class
+        if cls is None or cls in seen:
+            # Directly self-recursive structs cannot be instantiated anyway;
+            # treat them as non-zero to keep this check total.
+            return False
+        nested = build_model_schema(cls)
+        return all(_is_zero_size(ft, seen | {cls}) for ft in nested.values())
+    # Everything else writes at least one byte: ints/floats/bool, the u32
+    # prefix of string/bytes/vec/hashset/hashmap, and option/enum tags.
+    return False

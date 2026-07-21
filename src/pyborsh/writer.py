@@ -1,5 +1,6 @@
 """Borsh binary writer for serialization."""
 
+import math
 import struct
 
 
@@ -74,11 +75,18 @@ class BorshWriter:
         self._buffer.extend(value.to_bytes(16, "little", signed=True))
 
     def write_f32(self, value: float) -> None:
-        """Write a 32-bit float (IEEE 754, little-endian)."""
-        self._buffer.extend(struct.pack("<f", value))
+        """Write a 32-bit float (IEEE 754, little-endian). Raises ValueError on NaN or overflow."""
+        if math.isnan(value):  # Borsh spec: err_if_nan
+            raise ValueError("NaN is not a valid Borsh value")
+        try:
+            self._buffer.extend(struct.pack("<f", value))
+        except OverflowError as e:
+            raise ValueError(f"Value {value} out of range for f32") from e
 
     def write_f64(self, value: float) -> None:
-        """Write a 64-bit float (IEEE 754, little-endian)."""
+        """Write a 64-bit float (IEEE 754, little-endian). Raises ValueError on NaN."""
+        if math.isnan(value):  # Borsh spec: err_if_nan
+            raise ValueError("NaN is not a valid Borsh value")
         self._buffer.extend(struct.pack("<d", value))
 
     def write_bool(self, value: bool) -> None:
